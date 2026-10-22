@@ -177,3 +177,46 @@ fn node_zero_is_rejected_before_any_request() {
     assert_eq!(a.open(Eid::new(0, 1)).unwrap_err().errno, libc::EINVAL);
     assert_eq!(a.send(Eid::new(0, 1), b"x").unwrap_err().errno, libc::EINVAL);
 }
+
+#[test]
+fn polling_reuses_one_keep_alive_connection() {
+    let node = MockNode::start();
+    let mut a = adapter(&node);
+    a.open(Eid::new(20, 1)).unwrap();
+    assert_eq!(a.recv(Some(Duration::from_millis(300))).unwrap_err().errno, libc::EAGAIN);
+    let st = node.state.lock().unwrap();
+    assert!(st.endpoint_calls >= 10, "expected many polls, got {}", st.endpoint_calls);
+    assert_eq!(st.connections, 1, "every poll opened a new connection");
+}
+
+#[test]
+fn a_connection_the_server_silently_dropped_is_replaced() {
+    let node = MockNode::start();
+    node.state.lock().unwrap().drop_silently = true;
+    let mut a = adapter(&node);
+    a.open(Eid::new(20, 1)).unwrap();
+    for _ in 0..3 {
+        assert_eq!(a.recv(Some(Duration::ZERO)).unwrap_err().errno, libc::EAGAIN);
+    }
+    a.send(Eid::new(20, 2), b"still works").unwrap();
+}
+
+#[test]
+fn a_forked_child_does_not_share_the_parents_connection() {
+    let node = MockNode::start();
+    let mut a = adapter(&node);
+    a.open(Eid::new(10, 2)).unwrap(); // parent now holds a pooled connection
+    let before = node.state.lock().unwrap().connections;
+    // SAFETY: the child only calls the adapter and then `_exit`s.
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        let ok = a.send(Eid::new(20, 1), b"from child").is_ok();
+        unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+    }
+    let mut status = 0;
+    unsafe { libc::waitpid(pid, &mut status, 0) };
+    assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+    assert!(node.state.lock().unwrap().connections > before, "child reused the parent's socket");
+    // the parent's own connection is still good
+    a.send(Eid::new(20, 1), b"from parent").unwrap();
+}
