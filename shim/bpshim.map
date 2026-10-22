@@ -1,0 +1,8 @@
+{
+  global:
+    socket; bind; connect; listen; accept; accept4;
+    send; sendto; sendmsg; recv; recvfrom; recvmsg;
+    setsockopt; getsockopt; getsockname; getpeername; shutdown; close;
+  local:
+    *;
+};
