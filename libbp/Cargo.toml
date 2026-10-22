@@ -1,0 +1,22 @@
+[package]
+name = "bp"
+version = "0.1.0"
+edition = "2021"
+description = "Synchronous Bundle Protocol socket library with a C ABI (PoC for bp-socket without the kernel module)"
+
+[lib]
+name = "bp"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+bp7 = { version = "0.10.6", default-features = false }
+# Blocking HTTP client, no TLS, no background threads, no connection pooling (see dtn7.rs).
+ureq = { version = "2", default-features = false }
+libc = "0.2"
+
+[build-dependencies]
+cbindgen = { version = "0.27", default-features = false }
+
+[profile.release]
+# catch_unwind in capi.rs relies on unwinding panics.
+panic = "unwind"
