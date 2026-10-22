@@ -13,7 +13,9 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/syscall.h>
 #include <sys/uio.h>
+#include <netinet/ip.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -124,6 +126,17 @@ int main(void) {
   n = recv(recv_fd, buf, sizeof buf, 0);
   CHECK(n == 6 && memcmp(buf, "foobar", 6) == 0, "...and they arrive joined");
 
+  puts("read / write");
+  CHECK(write(send_fd, "w", 1) == 1, "write() on a connected BP fd sends");
+  n = read(recv_fd, buf, sizeof buf);
+  CHECK(n == 1 && buf[0] == 'w', "read() on a BP fd receives");
+
+  puts("setsockopt levels");
+  int one = 1;
+  CHECK(setsockopt(recv_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) == 0, "SOL_SOCKET options are accepted");
+  CHECK(setsockopt(recv_fd, IPPROTO_IP, IP_TTL, &one, sizeof one) == -1 && errno == ENOPROTOOPT,
+        "options of other levels -> ENOPROTOOPT");
+
   puts("timeouts and signals");
   set_timeout(recv_fd, 300);
   struct timeval got; socklen_t gl = sizeof got;
@@ -160,6 +173,31 @@ int main(void) {
   sendto(send_fd, "after", 5, 0, sa(&a1), sizeof a1);
   n = recv(recv_fd, buf, sizeof buf, 0);
   CHECK(n == 5 && memcmp(buf, "after", 5) == 0, "child closing its copy does not unregister the parent's endpoint");
+
+  puts("stale rows");
+  {
+    struct sockaddr_bp a3 = addr(10, 3);
+    int x = socket(AF_BP, SOCK_DGRAM, 0);
+    bind(x, sa(&a3), sizeof a3);
+    int dn = open("/dev/null", O_WRONLY);
+    dup2(dn, x); /* replaces the BP fd without going through close() */
+    errno = 0;
+    ssize_t w = write(x, "y", 1);
+    int e = errno;
+    errno = e;
+    CHECK(w == 1, "after dup2 over a BP fd, write() reaches the new file, not the shim");
+    close(x);
+
+    int y = socket(AF_BP, SOCK_DGRAM, 0);
+    bind(y, sa(&a3), sizeof a3);
+    syscall(SYS_close_range, y, y, 0); /* closes it behind the shim's back */
+    int z = open("/dev/null", O_WRONLY); /* the kernel hands the number out again */
+    errno = 0;
+    w = write(z, "y", 1);
+    CHECK(z == y && w == 1, "a file reusing an unclosed BP fd number is not hijacked");
+    close(z);
+    close(dn);
+  }
 
   puts("close / fd reuse");
   int old = send_fd;
