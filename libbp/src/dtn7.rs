@@ -7,9 +7,11 @@
 //! * `POST /insert`             send a complete CBOR bundle (lets us choose the source endpoint)
 //! * `POST /send?dst=&lifetime=` send a bare payload; dtn7-rs picks the node itself as source
 //!
-//! `/endpoint` never blocks, so `recv` polls. Every request uses a fresh
-//! connection (no pooling) and no thread is ever spawned, so nothing is shared
-//! across `fork`.
+//! `/endpoint` never blocks, so `recv` polls. Polling reuses one keep-alive
+//! connection per adapter (a fresh connection every 100 ms would pile up TIME_WAIT
+//! sockets). After a `fork` the child must not share the parent's connection, so
+//! the connection pool is rebuilt whenever the process id changes. No thread is
+//! ever spawned.
 
 use std::io::Read;
 use std::time::{Duration, Instant};
@@ -33,6 +35,13 @@ pub struct Dtn7Adapter {
     base: String,
     local: Option<Eid>,
     poll_interval: Duration,
+    /// Holds the keep-alive connection; replaced in a forked child (see `http`).
+    agent: ureq::Agent,
+    agent_pid: u32,
+}
+
+fn new_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new().timeout(REQUEST_TIMEOUT).build()
 }
 
 impl Dtn7Adapter {
@@ -41,6 +50,8 @@ impl Dtn7Adapter {
             base: base_url.trim_end_matches('/').to_string(),
             local: None,
             poll_interval: Duration::from_millis(100),
+            agent: new_agent(),
+            agent_pid: std::process::id(),
         }
     }
 
@@ -51,13 +62,16 @@ impl Dtn7Adapter {
 
     /// Performs one HTTP request and returns `(status, body)`. Non-2xx statuses are
     /// returned, not raised, so callers can react to e.g. 404.
-    fn http(&self, method: &str, path: &str, body: Option<&[u8]>) -> Result<(u16, Vec<u8>)> {
-        let agent = ureq::AgentBuilder::new()
-            .max_idle_connections(0)
-            .timeout(REQUEST_TIMEOUT)
-            .build();
+    fn http(&mut self, method: &str, path: &str, body: Option<&[u8]>) -> Result<(u16, Vec<u8>)> {
+        // A forked child inherits the parent's open connection; using it from both
+        // processes would interleave their requests. Start over with our own.
+        let pid = std::process::id();
+        if pid != self.agent_pid {
+            self.agent = new_agent();
+            self.agent_pid = pid;
+        }
         let url = format!("{}{}", self.base, path);
-        let request = agent.request(method, &url);
+        let request = self.agent.request(method, &url);
         let outcome = match body {
             Some(b) => request.send_bytes(b),
             None => request.call(),
@@ -85,13 +99,13 @@ impl Dtn7Adapter {
         }
     }
 
-    fn register(&self, eid: Eid) -> Result<()> {
+    fn register(&mut self, eid: Eid) -> Result<()> {
         let (status, body) = self.http("GET", &format!("/register?{}", eid), None)?;
         self.expect_ok("register", status, &body)
     }
 
     /// Asks the node for the next queued bundle. `Ok(None)` means nothing is waiting.
-    fn fetch(&self, eid: Eid) -> Result<Option<Bundle>> {
+    fn fetch(&mut self, eid: Eid) -> Result<Option<Bundle>> {
         let (status, body) = self.http("GET", &format!("/endpoint?{}", eid), None)?;
         if status == 404 {
             // The node forgot our registration (e.g. it restarted): claim it again.
@@ -107,7 +121,7 @@ impl Dtn7Adapter {
             .map_err(|e| BpError::protocol(format!("undecodable bundle from dtn7-rs: {:?}", e)))
     }
 
-    fn creation_timestamp(&self) -> Result<CreationTimestamp> {
+    fn creation_timestamp(&mut self) -> Result<CreationTimestamp> {
         let (status, body) = self.http("GET", "/cts", None)?;
         self.expect_ok("cts", status, &body)?;
         parse_cts(&body)
