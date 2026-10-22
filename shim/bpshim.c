@@ -9,20 +9,22 @@
  * A BP socket is a real eventfd, which reserves a valid, unique fd number; all of
  * its behaviour lives in libbp (Rust) behind the opaque BpSocket handle.
  *
- * Not supported (see README): poll/epoll, threads sharing a BP fd, dup, BP flags.
+ * read()/write() on a BP fd act as recv()/send(). Not supported (see README): poll/epoll
+ * (they see only the placeholder eventfd and never fire), threads sharing a BP fd, dup, BP flags.
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>
 #include <limits.h>
-#include <pthread.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/uio.h>
@@ -38,6 +40,9 @@
 struct bp_row {
   BpSocket *h;              /* libbp handle */
   pid_t pid;                /* process that created it (fork children only borrow it) */
+  dev_t dev;                /* identity of the placeholder eventfd, to notice if the fd was */
+  ino_t ino;                /* replaced behind our back (dup2, close_range, ...) */
+  mode_t mode;
   int protocol;             /* value passed to socket(), reported by SO_PROTOCOL */
   int nonblock;             /* created with SOCK_NONBLOCK */
   struct sockaddr_bp local; /* valid when bound */
@@ -49,53 +54,53 @@ struct bp_row {
   struct timeval snd_tv;    /* SO_SNDTIMEO is stored but never enforced */
 };
 
-static struct bp_row **table;
-static size_t table_len;
-static pthread_mutex_t table_mu = PTHREAD_MUTEX_INITIALIZER;
+/* Fixed, lock-free table indexed by fd. Wrapping read()/write() puts a lookup on every such
+ * call in the program, including from signal handlers, so it must not take a lock.
+ * Slot ownership is simple: only the creator of an fd number stores to it, and whoever
+ * removes a row (close or stale detection) gets it back from the exchange. */
+#define MAX_FDS 65536
+static _Atomic(struct bp_row *) table[MAX_FDS];
 
+static void row_release(struct bp_row *r);
+
+/* Returns the BP row for fd, or NULL if fd is not (or no longer) one of ours.
+ * Anything that closes or replaces the fd without going through close() (dup2,
+ * close_range, libc closing internally) would leave a stale row that could hijack
+ * whatever reuses the number, so the fd is checked against the eventfd we created.
+ * (All eventfds share one inode, so this cannot tell two eventfds apart; it does
+ * catch the fd turning into a file, socket, pipe, ... or being closed.) */
 static struct bp_row *row_get(int fd) {
-  struct bp_row *r = NULL;
-  if (fd < 0)
+  if (fd < 0 || fd >= MAX_FDS)
     return NULL;
-  pthread_mutex_lock(&table_mu);
-  if ((size_t)fd < table_len)
-    r = table[fd];
-  pthread_mutex_unlock(&table_mu);
-  return r;
+  struct bp_row *r = atomic_load(&table[fd]);
+  if (!r)
+    return NULL;
+  int saved = errno;
+  struct stat st;
+  if (fstat(fd, &st) == 0 && st.st_dev == r->dev && st.st_ino == r->ino &&
+      (st.st_mode & S_IFMT) == (r->mode & S_IFMT)) {
+    errno = saved;
+    return r;
+  }
+  if (atomic_compare_exchange_strong(&table[fd], &r, NULL))
+    row_release(r);
+  errno = saved;
+  return NULL;
 }
 
 static int row_put(int fd, struct bp_row *r) {
-  pthread_mutex_lock(&table_mu);
-  if ((size_t)fd >= table_len) {
-    size_t n = table_len ? table_len : 16;
-    while (n <= (size_t)fd)
-      n *= 2;
-    struct bp_row **t = realloc(table, n * sizeof(*t));
-    if (!t) {
-      pthread_mutex_unlock(&table_mu);
-      errno = ENOMEM;
-      return -1;
-    }
-    memset(t + table_len, 0, (n - table_len) * sizeof(*t));
-    table = t;
-    table_len = n;
+  if (fd >= MAX_FDS) {
+    errno = EMFILE;
+    return -1;
   }
-  table[fd] = r;
-  pthread_mutex_unlock(&table_mu);
+  atomic_store(&table[fd], r);
   return 0;
 }
 
 static struct bp_row *row_take(int fd) {
-  struct bp_row *r = NULL;
-  if (fd < 0)
+  if (fd < 0 || fd >= MAX_FDS)
     return NULL;
-  pthread_mutex_lock(&table_mu);
-  if ((size_t)fd < table_len) {
-    r = table[fd];
-    table[fd] = NULL;
-  }
-  pthread_mutex_unlock(&table_mu);
-  return r;
+  return atomic_exchange(&table[fd], NULL);
 }
 
 /* ---- real libc functions ----------------------------------------------- */
@@ -118,6 +123,8 @@ static int (*real_getsockname)(int, struct sockaddr *, socklen_t *);
 static int (*real_getpeername)(int, struct sockaddr *, socklen_t *);
 static int (*real_shutdown)(int, int);
 static int (*real_close)(int);
+static ssize_t (*real_read)(int, void *, size_t);
+static ssize_t (*real_write)(int, const void *, size_t);
 
 static int resolved;
 
@@ -126,10 +133,14 @@ static void resolve_all(void) {
   R(socket); R(bind); R(connect); R(listen); R(accept); R(accept4);
   R(send); R(sendto); R(sendmsg); R(recv); R(recvfrom); R(recvmsg);
   R(setsockopt); R(getsockopt); R(getsockname); R(getpeername);
-  R(shutdown); R(close);
+  R(shutdown); R(close); R(read); R(write);
 #undef R
   resolved = 1;
 }
+
+/* Resolve at load time so the first wrapped call never has to run dlsym (which allocates)
+ * from inside a signal handler. ENSURE() remains as a fallback for very early callers. */
+__attribute__((constructor)) static void shim_init(void) { resolve_all(); }
 
 /* Idempotent, so a benign race between threads is harmless. */
 #define ENSURE() do { if (!resolved) resolve_all(); } while (0)
@@ -144,6 +155,14 @@ static int debug_on(void) {
   return state;
 }
 #define DBG(...) do { if (debug_on()) { fprintf(stderr, "[bpshim] " __VA_ARGS__); fputc('\n', stderr); } } while (0)
+
+/* Drops a row whose fd is gone: release the endpoint (only in the process that owns it;
+ * a forked child just drops its copy) and free it. */
+static void row_release(struct bp_row *r) {
+  if (r->pid == getpid())
+    bp_close(r->h);
+  free(r);
+}
 
 /* ---- helpers ----------------------------------------------------------- */
 
@@ -272,12 +291,18 @@ SHIM_EXPORT int socket(int domain, int type, int protocol) {
     return -1;
 
   struct bp_row *r = calloc(1, sizeof(*r));
-  if (!r) {
+  struct stat st;
+  if (!r || fstat(fd, &st) < 0) {
+    int e = r ? errno : ENOMEM;
+    free(r);
     real_close(fd);
-    errno = ENOMEM;
+    errno = e;
     return -1;
   }
   r->pid = getpid();
+  r->dev = st.st_dev;
+  r->ino = st.st_ino;
+  r->mode = st.st_mode;
   r->protocol = protocol;
   r->nonblock = (type & SOCK_NONBLOCK) != 0;
   r->rcv_ms = -1;
@@ -503,8 +528,12 @@ SHIM_EXPORT int setsockopt(int fd, int level, int opt, const void *val, socklen_
     }
     return 0;
   }
-  /* Any other option has no BP meaning here; accept it so apps that tune
-   * buffers or reuse flags keep working. */
+  /* Other socket-level options (buffers, reuse flags, ...) have no BP meaning here; accept
+   * them so apps that tune them keep working. Other levels (IP, TCP, ...) do not exist. */
+  if (level != SOL_SOCKET) {
+    errno = ENOPROTOOPT;
+    return -1;
+  }
   return 0;
 }
 
@@ -573,6 +602,24 @@ SHIM_EXPORT int shutdown(int fd, int how) {
   return real_shutdown(fd, how);
 }
 
+SHIM_EXPORT ssize_t read(int fd, void *buf, size_t len) {
+  ENSURE();
+  struct bp_row *r = row_get(fd);
+  if (!r)
+    return real_read(fd, buf, len);
+  struct sockaddr_bp from;
+  size_t full = 0;
+  return bp_recv(r, buf, len, 0, &from, &full);
+}
+
+SHIM_EXPORT ssize_t write(int fd, const void *buf, size_t len) {
+  ENSURE();
+  struct bp_row *r = row_get(fd);
+  if (!r)
+    return real_write(fd, buf, len);
+  return bp_send(r, buf, len, NULL, 0);
+}
+
 SHIM_EXPORT int close(int fd) {
   ENSURE();
   struct bp_row *r = row_take(fd);
@@ -594,8 +641,8 @@ SHIM_EXPORT int close(int fd) {
 /* Unregister endpoints of sockets the program never closed. */
 __attribute__((destructor)) static void shim_exit(void) {
   pid_t me = getpid();
-  for (size_t i = 0; i < table_len; i++) {
-    struct bp_row *r = table[i];
+  for (size_t i = 0; i < MAX_FDS; i++) {
+    struct bp_row *r = atomic_load(&table[i]);
     if (r && r->pid == me && r->h) {
       bp_close(r->h);
       r->h = NULL;
