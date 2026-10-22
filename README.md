@@ -35,16 +35,20 @@ Your own program: `LD_PRELOAD=./libbpshim.so ./yourapp`
 - `bind` registers `ipn:<node>.<service>` with the node. `connect` stores a default destination (UDP-style).
 - `sendto`/`send`/`sendmsg` return the byte count. A bound socket is the bundle's source.
 - `recvfrom`/`recv`/`recvmsg` poll the node until a bundle arrives or `SO_RCVTIMEO` expires (`EAGAIN`). Signals give `EINTR`. Excess data is truncated like UDP.
-- `listen`/`accept`: `EOPNOTSUPP`. Node not running: `ECONNREFUSED`.
+- `read`/`write` act as `recv`/`send`. `listen`/`accept`: `EOPNOTSUPP`. Node not running: `ECONNREFUSED`.
 
 ## Limitations
 
-- No concurrency: no threads, no async. A receive blocks its thread; sharing a BP fd between threads is unsupported.
-- Not intercepted: `poll`/`epoll`/`select`, `read`/`write`, `dup`, `fcntl(O_NONBLOCK)`. Upstream's poll support is therefore not replicated.
+- No concurrency: no threads, no async. A receive blocks its thread. Sharing a BP fd between threads is unsupported and can crash (`close` frees state another thread may be using).
+- `poll`/`epoll`/`select` do not work: the BP fd never becomes ready, so waiting on one hangs (or times out) even when a bundle is queued. Upstream's poll support is not replicated. `dup` and `fcntl(O_NONBLOCK)` are not intercepted either (use `SOCK_NONBLOCK` / `MSG_DONTWAIT`).
 - No BP flags (priority, custody, status reports); the `flags` argument is ignored.
 - Only the `ipn:` scheme and only dtn7-rs (no `dtn:`, no ION/ud3tn).
 - Only tried with the two demo programs, two nodes on localhost, on one Linux/glibc machine. Large bundles, long runs and multi-host routing are untested.
 - dtn7-rs's HTTP API is unauthenticated on localhost: any local user can send as any endpoint.
+- A blocked receive always returns `EINTR` on a signal; a real socket without `SO_RCVTIMEO` would restart it under `SA_RESTART`.
+- Endpoints are unregistered on `close` and at normal exit; after `kill -9` or `abort` dtn7-rs keeps the registration.
+- If a BP fd is replaced behind the shim's back (`dup2`, `close_range`) it is noticed with `fstat`, except when replaced by another eventfd.
+- `receiver.c` passes protocol `1` and `sender.c` passes `0` (an upstream inconsistency); the shim accepts both.
 - The node must already have a route to the destination (`demo.sh` links the two nodes).
 - `sender.c` exits with status 7 on success (it returns `sendto`'s byte count); that is upstream behaviour.
 
