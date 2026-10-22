@@ -1,0 +1,7 @@
+# build outputs and downloaded dependencies
+/libbpshim.so
+/sender
+/receiver
+/libbp/target/
+/.tools/
+/third_party/
